@@ -1,0 +1,1 @@
+ThreadLocal是一个线程本地变量。  
