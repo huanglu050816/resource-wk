@@ -1,4 +1,4 @@
-# AQS 同步器、reentrantlock、fork join、countdownlatch
+# AQS 同步器、reentrantlock、countdownlatch
 
 ## countdownlatch闭锁
 * 所有子线程共用一个 countdownlatch对象，
@@ -335,5 +335,169 @@ https://www.jianshu.com/p/89132109d49d
         //这个Node 跟AQS是一个类，也就是说结构是一样的
         但是Condition的node没有pre和next值，但是有nextWaiter，所以condition是个单向链表
   ```
-* 如线程 1 调用 condition1.await() 方法即可将当前线程 1 包装成 Node 后加入到条件队列中，然后阻塞在这里，不继续往下执行，条件队列是一个单向链表；
+* 如线程 1 调用 condition1.await() 方法即可将当前线程 1 包装成 Node 后加入到条件队列中，然后阻塞在这里，不继续往下执行，条件队列是一个单向链表；并且此时也会释放锁。
+  ```
+    // 首先，这个方法是可被中断的，不可被中断的是另一个方法 awaitUninterruptibly()
+    // 这个方法会阻塞，直到调用 signal 方法（指 signal() 和 signalAll()，下同），或被中断
+    public final void await() throws InterruptedException {
+        // 老规矩，既然该方法要响应中断，那么在最开始就判断中断状态
+        if (Thread.interrupted())
+            throw new InterruptedException();
+
+        // 添加到 condition 的条件队列中
+        Node node = addConditionWaiter();
+
+        // 释放锁，返回值是释放锁之前的 state 值
+        // await() 之前，当前线程是必须持有锁的，这里肯定要释放掉
+        int savedState = fullyRelease(node);
+
+        int interruptMode = 0;
+        // 这里退出循环有两种情况，之后再仔细分析
+        // 1. isOnSyncQueue(node) 返回 true，即当前 node 已经转移到阻塞队列了
+        // 2. checkInterruptWhileWaiting(node) != 0 会到 break，然后退出循环，代表的是线程中断
+        // 如果不在阻塞队列中，注意了，是阻塞队列 
+        while (!isOnSyncQueue(node)) {
+            LockSupport.park(this);// 线程挂起
+            if ((interruptMode = checkInterruptWhileWaiting(node)) != 0)
+                break;
+        }
+        // 被唤醒后，将进入阻塞队列，等待获取锁
+        if (acquireQueued(node, savedState) && interruptMode != THROW_IE)
+            interruptMode = REINTERRUPT;
+        if (node.nextWaiter != null) // clean up if cancelled
+            unlinkCancelledWaiters();
+        if (interruptMode != 0)
+            reportInterruptAfterWait(interruptMode);
+    }
+
+  ```
+* 如果一个线程在不持有 lock 的基础上，就去调用 condition1.await() 方法，它能进入条件队列，但是在上面的这个方法中，由于它不持有锁，release(savedState) 这个方法肯定要返回 false，进入到异常分支，然后进入 finally 块设置 node.waitStatus = Node.CANCELLED，这个已经入队的节点之后会被后继的节点"请出去"。
 * 调用condition1.signal() 触发一次唤醒，此时唤醒的是队头，会将condition1 对应的条件队列的 firstWaiter（队头） 移到阻塞队列的队尾，等待获取锁，获取锁后 await 方法才能返回，继续往下执行。
+```
+    // 唤醒等待了最久的线程
+    // 其实就是，将这个线程对应的 node 从条件队列转移到阻塞队列
+    public final void signal() {
+        // 调用 signal 方法的线程必须持有当前的独占锁
+        if (!isHeldExclusively())
+            throw new IllegalMonitorStateException();
+        Node first = firstWaiter;
+        if (first != null)
+            doSignal(first);
+    }
+
+    // 从条件队列队头往后遍历，找出第一个需要转移的 node
+    // 因为前面我们说过，有些线程会取消排队，但是可能还在队列中
+    private void doSignal(Node first) {
+        do {
+            // 将 firstWaiter 指向 first 节点后面的第一个，因为 first 节点马上要离开了
+            // 如果将 first 移除后，后面没有节点在等待了，那么需要将 lastWaiter 置为 null
+            if ( (firstWaiter = first.nextWaiter) == null)
+                lastWaiter = null;
+            // 因为 first 马上要被移到阻塞队列了，和条件队列的链接关系在这里断掉
+            first.nextWaiter = null;
+        } while (!transferForSignal(first) &&
+                (first = firstWaiter) != null);
+        // 这里 while 循环，如果 first 转移不成功，那么选择 first 后面的第一个节点进行转移，依此类推
+    }
+
+    // 将节点从条件队列转移到阻塞队列
+    // true 代表成功转移
+    // false 代表在 signal 之前，节点已经取消了
+    final boolean transferForSignal(Node node) {
+
+        // CAS 如果失败，说明此 node 的 waitStatus 已不是 Node.CONDITION，说明节点已经取消，
+        // 既然已经取消，也就不需要转移了，方法返回，转移后面一个节点
+        // 否则，将 waitStatus 置为 0
+        if (!compareAndSetWaitStatus(node, Node.CONDITION, 0))
+            return false;
+
+        // enq(node): 自旋进入阻塞队列的队尾
+        // 注意，这里的返回值 p 是 node 在阻塞队列的前驱节点
+        Node p = enq(node);
+        int ws = p.waitStatus;
+        // ws > 0 说明 node 在阻塞队列中的前驱节点取消了等待锁，直接唤醒 node 对应的线程。唤醒之后会怎么样，后面再解释
+        // 如果 ws <= 0, 那么 compareAndSetWaitStatus 将会被调用，节点入队后，需要把前驱节点的状态设为 Node.SIGNAL(-1)
+        if (ws > 0 || !compareAndSetWaitStatus(p, ws, Node.SIGNAL))
+            // 如果前驱节点取消或者 CAS 失败，会进到这里唤醒线程，之后的操作看下一节
+            LockSupport.unpark(node.thread);
+        return true;
+    }
+```
+* 用aqs的condition实现生产者消费者模型，当然阻塞队列（block queue）是天生的自带生产者消费者模型的队列
+```
+   static class Resource{
+        LinkedList<String> list = new LinkedList<>();
+        int MAX_SIZE = 10;
+        Lock lock = new ReentrantLock();
+        Condition inCondition = lock.newCondition();
+        Condition outCondition = lock.newCondition();
+
+        public synchronized void produce(String element) throws InterruptedException {
+            lock.lockInterruptibly();
+            try{
+                while(list.size() >= MAX_SIZE){
+                    //将当前线程封装成node加入到inCondition,并且释放当前锁。
+                    inCondition.await();
+                }
+                list.addLast(element);
+                System.out.println(Arrays.toString(new LinkedList[]{list}));
+                //唤醒outCondition队列的队头，将outCondition的队头加入到lock的阻塞队列,让consume
+                outCondition.signalAll();
+                //这里的inCondition、outCondition使用的锁都是try上面获取的那个锁
+            }  finally {
+                lock.unlock();
+            }
+        }
+
+        public String consume() throws InterruptedException {
+            lock.lockInterruptibly();
+            try{
+                while(list.size() == 0){
+                    outCondition.await();
+                }
+                String ele = list.removeFirst();
+                System.out.println(Arrays.toString(new LinkedList[]{list}));
+                inCondition.signalAll();
+                return ele;
+            }finally {
+                lock.unlock();
+            }
+        }
+    }
+
+    public static void main(String[] args){
+        final Resource resource = new Resource();
+        for(int i =0; i< 5; i++){
+            new Thread(()->{
+                try {
+                    while(true) {
+                        Thread.sleep(1000);
+                        resource.produce(new Random().nextInt(100) + "");
+                    }
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }).start();
+        }
+
+        try {
+            Thread.sleep(10000);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+
+
+        for(int i =0; i< 5; i++){
+            new Thread(()->{
+                try {
+                    while(true) {
+                        Thread.sleep(2000);
+                        resource.consume();
+                    }
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }).start();
+        }
+    }
+```
