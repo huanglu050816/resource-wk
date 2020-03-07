@@ -18,11 +18,13 @@
 # queue
 
 * BlockingQueue
+  
    * ArrayBlockingQueue  
    * LinkedBlockingQueue
    * PriorityBlockingQueue
    * DelayQueue
    * SynchronousQueue
+  
 * Deque
 * SynchronizedQueue
 * ConcurrentLinkedQueue
